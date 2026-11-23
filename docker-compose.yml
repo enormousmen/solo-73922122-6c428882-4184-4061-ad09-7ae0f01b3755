@@ -1,22 +1,66 @@
-# Campus monitoring gateway: public UDP port lease API (single instance).
+# Campus monitoring gateway: public UDP port lease API (sharded cluster).
+#
+# Layout: ONE stateless HTTP entry (the only client-facing endpoint) in front
+# of TWO worker processes that hold the leases in memory.
+#
+#   * Peers are pinned to a worker by SHA-256(peer_ipv4:peer_port) % 2, so a
+#     peer's allocate + reply-lookup traffic always hits the same process.
+#   * Lease ids embed the owning shard (lease-s<shard>-...), so renew/release
+#     are routed by the entry using nothing but the lease id.
+#   * Both workers use the SAME public port pool; sharing and the 5 s
+#     isolation stay per (public_port, peer) exactly as before.
+#   * The entry holds no state: `docker compose restart entry` never affects
+#     existing leases. A paused/dead worker yields 503 for its own peers only
+#     (never re-routed); the other shard keeps serving.
 #
 # Demo configuration: the pool is a SINGLE port so two peers visibly share
 # one public port, and the 5 s isolation window is easy to observe.
+
+x-worker-base: &worker-base
+  build: .
+  image: campus-gateway-port-allocator:latest
+  command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+  restart: unless-stopped
+  environment: &worker-env
+    # Public IPv4 of the gateway that forwards probe UDP polling.
+    PUBLIC_IPV4: "203.0.113.10"
+    # One-port pool for the demo. In production set a real contiguous range;
+    # both workers MUST get the same range.
+    POOL_START: "40000"
+    POOL_END: "40000"
+    LEASE_TTL_SECONDS: "30"
+    ISOLATION_TTL_SECONDS: "5"
+    # Total worker count; must match the number of WORKER_URLS on the entry.
+    SHARD_COUNT: "2"
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 5s
+
 services:
-  port-allocator:
+  entry:
     build: .
     image: campus-gateway-port-allocator:latest
-    container_name: campus-gateway-port-allocator
+    container_name: campus-gateway-entry
+    command: ["uvicorn", "--factory", "app.entry:create_entry_app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
     ports:
       - "8080:8080"
     environment:
-      # Public IPv4 of the gateway that forwards probe UDP polling.
+      # Same business settings as the workers (used for the / info endpoint).
       PUBLIC_IPV4: "203.0.113.10"
-      # One-port pool for the demo. In production set a real contiguous range.
       POOL_START: "40000"
       POOL_END: "40000"
       LEASE_TTL_SECONDS: "30"
       ISOLATION_TTL_SECONDS: "5"
+      # Ordered by shard index: first URL is SHARD_INDEX=0, second is 1.
+      WORKER_URLS: "http://worker-0:8080,http://worker-1:8080"
+      # A worker slower than this is reported as 503 for its own peers.
+      WORKER_TIMEOUT_SECONDS: "2"
+    depends_on:
+      - worker-0
+      - worker-1
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"]
@@ -24,3 +68,17 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+
+  worker-0:
+    <<: *worker-base
+    container_name: campus-gateway-worker-0
+    environment:
+      <<: *worker-env
+      SHARD_INDEX: "0"
+
+  worker-1:
+    <<: *worker-base
+    container_name: campus-gateway-worker-1
+    environment:
+      <<: *worker-env
+      SHARD_INDEX: "1"

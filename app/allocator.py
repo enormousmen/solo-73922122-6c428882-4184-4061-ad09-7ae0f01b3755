@@ -156,7 +156,14 @@ class PeerState:
 
 
 class PortAllocator:
-    """Thread-safe, in-memory lease store for a single API instance."""
+    """Thread-safe, in-memory lease store for a single worker process.
+
+    ``shard_label`` (worker mode) stamps every minted lease id with the
+    owning shard -- ``lease-s<label>-<seq>-<rand>`` -- so a stateless entry
+    can route renew/release back to this process using only the lease id.
+    With the default ``None`` the historical ``lease-<seq>-<rand>`` format
+    is kept (standalone single-instance mode).
+    """
 
     def __init__(
         self,
@@ -165,6 +172,7 @@ class PortAllocator:
         lease_ttl_seconds: float,
         isolation_ttl_seconds: float,
         *,
+        shard_label: str | None = None,
         clock=time.monotonic,
         wall_clock=time.time,
     ) -> None:
@@ -178,6 +186,7 @@ class PortAllocator:
         self.pool_end = pool_end
         self.lease_ttl = float(lease_ttl_seconds)
         self.isolation_ttl = float(isolation_ttl_seconds)
+        self._shard_label = shard_label
         self._clock = clock
         self._wall_clock = wall_clock
         self._peers: dict[tuple[str, int], PeerState] = {}
@@ -197,7 +206,11 @@ class PortAllocator:
         return self._clock()
 
     def _new_lease_id(self) -> str:
-        return f"lease-{next(self._id_seq):08d}-{uuid.uuid4().hex[:12]}"
+        seq = next(self._id_seq)
+        rand = uuid.uuid4().hex[:12]
+        if self._shard_label is None:
+            return f"lease-{seq:08d}-{rand}"
+        return f"lease-s{self._shard_label}-{seq:08d}-{rand}"
 
     def _peer(self, peer_ipv4: str, peer_port: int) -> PeerState:
         key = (peer_ipv4, peer_port)

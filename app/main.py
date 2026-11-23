@@ -1,4 +1,14 @@
-"""FastAPI application: public UDP port lease allocation for the gateway."""
+"""FastAPI application: public UDP port lease allocation for the gateway.
+
+This module serves two roles:
+
+* **standalone** (``SHARD_INDEX`` unset): the historical single-instance
+  deployment, one process holding the whole lease store;
+* **worker** (``SHARD_INDEX``/``SHARD_COUNT`` set): one of several sharded
+  workers behind the stateless entry (see :mod:`app.entry`). The worker owns
+  exactly the peers routed to its shard and stamps its lease ids with the
+  shard marker so the entry can route renew/release by id alone.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +27,7 @@ from .schemas import (
     MessageResponse,
     _expiry_datetime,
 )
+from .sharding import shard_for_peer
 
 
 def build_lease_response(
@@ -50,7 +61,33 @@ def create_app(settings: Settings | None = None, allocator: PortAllocator | None
             pool_end=settings.pool_end,
             lease_ttl_seconds=settings.lease_ttl_seconds,
             isolation_ttl_seconds=settings.isolation_ttl_seconds,
+            shard_label=(
+                None if settings.shard_index is None else str(settings.shard_index)
+            ),
         )
+
+    shard_index = settings.shard_index
+    shard_count = settings.shard_count
+
+    def _check_ownership(peer_ipv4: str, peer_port: int) -> None:
+        """Refuse peers this worker does not own (worker mode only).
+
+        The entry routes by the same hash, so a mismatch means the deployment
+        is miswired (e.g. WORKER_URLS order vs SHARD_INDEX). Refusing keeps a
+        peer's state from silently splitting across two processes; the entry
+        never re-routes, so the client just sees 503.
+        """
+        if shard_index is None:
+            return
+        owner = shard_for_peer(peer_ipv4, peer_port, shard_count)
+        if owner != shard_index:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"peer {peer_ipv4}:{peer_port} is owned by shard {owner}, "
+                    f"this worker is shard {shard_index}"
+                ),
+            )
 
     app = FastAPI(
         title="Campus Gateway Port Allocation API",
@@ -76,11 +113,13 @@ def create_app(settings: Settings | None = None, allocator: PortAllocator | None
     async def root() -> dict:
         return {
             "service": "campus-gateway-port-allocator",
+            "mode": "worker" if shard_index is not None else "standalone",
             "version": __version__,
             "public_ipv4": settings.public_ipv4,
             "pool": {"start": settings.pool_start, "end": settings.pool_end},
             "lease_ttl_seconds": settings.lease_ttl_seconds,
             "isolation_ttl_seconds": settings.isolation_ttl_seconds,
+            "shard": {"index": shard_index, "count": shard_count},
             "docs": "/docs",
         }
 
@@ -92,6 +131,7 @@ def create_app(settings: Settings | None = None, allocator: PortAllocator | None
         responses={503: {"model": MessageResponse}},
     )
     async def allocate(body: AllocateRequest) -> LeaseResponse:
+        _check_ownership(body.peer_ipv4, body.peer_port)
         try:
             lease, reused = allocator.allocate(
                 probe_ipv4=body.probe_ipv4,
@@ -153,6 +193,7 @@ def create_app(settings: Settings | None = None, allocator: PortAllocator | None
         responses={404: {"model": LookupResponse}},
     )
     async def lookup(public_port: int, peer_ipv4: str, peer_port: int):
+        _check_ownership(peer_ipv4, peer_port)
         lease = allocator.lookup(public_port, peer_ipv4, peer_port)
         if lease is None:
             # 404 carries the structured "no mapping" body so clients get one
